@@ -136,10 +136,116 @@ jobs:
           echo "⏳ Esperando a que la instancia esté lista..."
           sleep 60
 
+  setup_docker:
+    name: Install Docker on VM
+    runs-on: ubuntu-latest
+    needs: infrastructure
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Wait for SSH to be ready
+        run: |
+          INSTANCE_IP="${{ needs.infrastructure.outputs.instance_ip }}"
+          echo "⏳ Esperando conexión SSH en $INSTANCE_IP..."
+          
+          for i in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              -i ~/.ssh/id_rsa ubuntu@$INSTANCE_IP "echo '✅ SSH conectado'"; then
+              echo "✓ Conexión SSH establecida!"
+              break
+            fi
+            
+            if [ $i -eq 30 ]; then
+              echo "✗ Timeout esperando SSH"
+              exit 1
+            fi
+            
+            echo "Intento $i/30 - esperando 10 segundos..."
+            sleep 10
+          done
+
+      - name: Install Docker and Docker Compose
+        run: |
+          INSTANCE_IP="${{ needs.infrastructure.outputs.instance_ip }}"
+          
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@$INSTANCE_IP << 'ENDSSH'
+            set -e
+            
+            echo "=== 🔄 Actualizando sistema ==="
+            sudo apt-get update
+            
+            echo "=== 📦 Instalando dependencias ==="
+            sudo apt-get install -y \
+              ca-certificates \
+              curl \
+              gnupg \
+              lsb-release \
+              apt-transport-https
+            
+            echo "=== 🔑 Agregando Docker GPG key ==="
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+              sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            
+            echo "=== 📋 Agregando repositorio de Docker ==="
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+              https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | \
+              sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            
+            echo "=== 🐳 Instalando Docker ==="
+            sudo apt-get update
+            sudo apt-get install -y \
+              docker-ce \
+              docker-ce-cli \
+              containerd.io \
+              docker-compose-plugin
+            
+            echo "=== ⚙️ Configurando Docker ==="
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            sudo usermod -aG docker ubuntu
+            
+            echo "=== 📥 Instalando Docker Compose standalone ==="
+            sudo curl -L \
+              "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" \
+              -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+            
+            echo "=== 🔥 Configurando firewall ==="
+            sudo ufw --force enable
+            sudo ufw allow 22/tcp
+            sudo ufw allow 80/tcp
+            sudo ufw allow 443/tcp
+            sudo ufw allow 3000/tcp
+            sudo ufw allow 8000/tcp
+            
+            echo "=== 🛡️ Configurando iptables para Oracle Cloud ==="
+            sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+            sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+            sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 3000 -j ACCEPT
+            sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 8000 -j ACCEPT
+            
+            # Guardar reglas de iptables
+            sudo apt-get install -y iptables-persistent
+            sudo netfilter-persistent save
+            
+            echo "=== ✅ Verificando instalaciones ==="
+            docker --version
+            docker-compose --version
+            
+            echo "=== 🎉 ¡Instalación de Docker completada exitosamente! ==="
+          ENDSSH
+
   deploy:
     name: Deploy Application
     runs-on: ubuntu-latest
-    needs: infrastructure
+    needs: [infrastructure, setup_docker]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -151,34 +257,46 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ needs.infrastructure.outputs.instance_ip }} >> ~/.ssh/known_hosts
 
-      - name: Deploy with Docker Compose
+      - name: Copy docker-compose.yml to server
         run: |
           scp -i ~/.ssh/id_rsa docker-compose.yml ubuntu@${{ needs.infrastructure.outputs.instance_ip }}:/home/ubuntu/
+
+      - name: Deploy with Docker Compose
+        run: |
           ssh -i ~/.ssh/id_rsa ubuntu@${{ needs.infrastructure.outputs.instance_ip }} << 'EOF'
-            # Actualizar imágenes
+            set -e
+            
+            echo "=== 🔐 Logging into Docker Hub ==="
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKER_USERNAME }}" --password-stdin
+            
+            echo "=== 📥 Pulling Docker images ==="
             docker pull ${{ env.BACKEND_IMAGE }}:latest
             docker pull ${{ env.FRONTEND_IMAGE }}:latest
             
-            # Detener contenedores existentes
+            echo "=== 🛑 Deteniendo contenedores existentes ==="
             docker compose down || true
             
-            # Iniciar nuevos contenedores
+            echo "=== 🚀 Iniciando nuevos contenedores ==="
             docker compose up -d
             
-            # Mostrar estado
+            echo "=== 📊 Mostrando estado de contenedores ==="
             docker ps
             
-            # Verificar logs
+            echo "=== 📋 Verificando logs ==="
             sleep 10
-            docker compose logs
+            docker compose logs --tail=50
+            
+            echo "=== ✅ Despliegue completado ==="
           EOF
 
-      - name: Configure Firewall
+      - name: Verify Firewall Configuration
         run: |
           ssh -i ~/.ssh/id_rsa ubuntu@${{ needs.infrastructure.outputs.instance_ip }} << 'EOF'
-            sudo ufw allow 3000/tcp
-            sudo ufw allow 8000/tcp
-            sudo ufw status
+            echo "=== 🔍 Verificando configuración del firewall ==="
+            sudo ufw status verbose
+            echo ""
+            echo "=== 🔍 Verificando reglas de iptables ==="
+            sudo iptables -L INPUT -n --line-numbers | grep -E '(3000|8000)'
           EOF
 
       - name: Health Check
@@ -190,10 +308,10 @@ jobs:
           FRONTEND_URL="http://${{ needs.infrastructure.outputs.instance_ip }}:3000"
           
           echo "Verificando Backend: $BACKEND_URL"
-          curl -f $BACKEND_URL || echo "⚠️ Backend no responde"
+          curl -f $BACKEND_URL || echo "⚠️ Backend no responde aún"
           
           echo "Verificando Frontend: $FRONTEND_URL"
-          curl -f $FRONTEND_URL || echo "⚠️ Frontend no responde"
+          curl -f $FRONTEND_URL || echo "⚠️ Frontend no responde aún"
 
   notify:
     name: Send Notification
