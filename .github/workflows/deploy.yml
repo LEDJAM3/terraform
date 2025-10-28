@@ -168,6 +168,51 @@ jobs:
             sleep 10
           done
 
+      - name: Wait for cloud-init and system updates to complete
+        run: |
+          INSTANCE_IP="${{ needs.infrastructure.outputs.instance_ip }}"
+          
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@$INSTANCE_IP << 'ENDSSH'
+            echo "=== ⏳ Esperando que cloud-init termine ==="
+            cloud-init status --wait || true
+            
+            echo "=== ⏳ Esperando que apt termine procesos automáticos ==="
+            # Esperar hasta 5 minutos para que apt se libere
+            timeout=300
+            elapsed=0
+            
+            while [ $elapsed -lt $timeout ]; do
+              if ! sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 && \
+                 ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+                 ! sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+                echo "✅ apt está disponible"
+                break
+              fi
+              
+              echo "⏳ apt está bloqueado, esperando... ($elapsed/$timeout segundos)"
+              sleep 10
+              elapsed=$((elapsed + 10))
+            done
+            
+            # Matar procesos de apt si aún están corriendo
+            if [ $elapsed -ge $timeout ]; then
+              echo "⚠️ Timeout alcanzado, matando procesos de apt..."
+              sudo killall apt apt-get || true
+              sleep 5
+            fi
+            
+            # Limpiar bloqueos si existen
+            sudo rm -f /var/lib/apt/lists/lock
+            sudo rm -f /var/lib/dpkg/lock-frontend
+            sudo rm -f /var/lib/dpkg/lock
+            sudo rm -f /var/cache/apt/archives/lock
+            
+            # Reconfigurar dpkg por si quedó algo corrupto
+            sudo dpkg --configure -a
+            
+            echo "✅ Sistema listo para instalación"
+          ENDSSH
+
       - name: Install Docker and Docker Compose
         run: |
           INSTANCE_IP="${{ needs.infrastructure.outputs.instance_ip }}"
@@ -176,10 +221,10 @@ jobs:
             set -e
             
             echo "=== 🔄 Actualizando sistema ==="
-            sudo apt-get update
+            sudo apt-get update -y
             
             echo "=== 📦 Instalando dependencias ==="
-            sudo apt-get install -y \
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
               ca-certificates \
               curl \
               gnupg \
@@ -199,8 +244,8 @@ jobs:
               sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
             
             echo "=== 🐳 Instalando Docker ==="
-            sudo apt-get update
-            sudo apt-get install -y \
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
               docker-ce \
               docker-ce-cli \
               containerd.io \
@@ -231,8 +276,10 @@ jobs:
             sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 3000 -j ACCEPT
             sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 8000 -j ACCEPT
             
-            # Guardar reglas de iptables
-            sudo apt-get install -y iptables-persistent
+            # Instalar iptables-persistent para guardar reglas
+            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | sudo debconf-set-selections
+            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | sudo debconf-set-selections
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
             sudo netfilter-persistent save
             
             echo "=== ✅ Verificando instalaciones ==="
