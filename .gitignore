@@ -1,0 +1,45 @@
+# Terraform
+Terraform/*.tfstate
+Terraform/*.tfstate.*
+Terraform/*.tfvars
+Terraform/.terraform/
+Terraform/.terraform.lock.hcl
+Terraform/terraform.tfplan
+Terraform/tfplan
+
+# Claves privadas y secretos
+*.pem
+*.key
+*.pub
+.ssh/
+*.cer
+*.crt
+
+# Node.js
+Backend/node_modules/
+Backend/npm-debug.log*
+Backend/yarn-debug.log*
+Backend/yarn-error.log*
+Backend/package-lock.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Temporales
+tmp/
+temp/
+*.tmp
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local

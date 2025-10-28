@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>App Fullstack - Práctica 3.2</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Aplicación Fullstack</h1>
+            <p class="subtitle">Desplegada con Terraform + GitHub Actions + Docker</p>
+        </header>
+
+        <main>
+            <div class="card">
+                <h2>📡 Conexión con Backend</h2>
+                <button id="testBtn" class="btn">Probar Conexión</button>
+                <div id="result" class="result"></div>
+            </div>
+
+            <div class="card">
+                <h2>📝 Enviar Mensaje</h2>
+                <input type="text" id="messageInput" placeholder="Escribe un mensaje..." class="input">
+                <button id="sendBtn" class="btn">Enviar</button>
+                <div id="messageResult" class="result"></div>
+            </div>
+
+            <div class="card">
+                <h2>ℹ️ Información del Despliegue</h2>
+                <ul class="info-list">
+                    <li><strong>Infraestructura:</strong> Oracle Cloud (OCI)</li>
+                    <li><strong>Automatización:</strong> Terraform</li>
+                    <li><strong>CI/CD:</strong> GitHub Actions</li>
+                    <li><strong>Contenedores:</strong> Docker + DockerHub</li>
+                    <li><strong>Frontend:</strong> Nginx (HTML/CSS/JS)</li>
+                    <li><strong>Backend:</strong> Node.js + Express</li>
+                </ul>
+            </div>
+        </main>
+
+        <footer>
+            <p>Práctica 3.2 - Despliegue Automatizado</p>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

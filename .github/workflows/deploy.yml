@@ -1,0 +1,257 @@
+name: Deploy Fullstack App
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  DOCKER_USERNAME: ledjam
+  FRONTEND_IMAGE: ledjam/frontend-app
+  BACKEND_IMAGE: ledjam/backend-api
+  NOTIFICATION_EMAIL: diegomelna14@gmail.com
+
+jobs:
+  checkout:
+    name: Checkout Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Show repository structure
+        run: |
+          echo "📁 Estructura del repositorio:"
+          ls -la
+
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: checkout
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./Backend
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:latest
+            ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.BACKEND_IMAGE }}:latest
+          cache-to: type=inline
+
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./Frontend
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:latest
+            ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.FRONTEND_IMAGE }}:latest
+          cache-to: type=inline
+
+  infrastructure:
+    name: Provision Infrastructure
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      instance_ip: ${{ steps.terraform-output.outputs.ip }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Configure Oracle Cloud credentials
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/private_key.pem
+          chmod 600 ~/.oci/private_key.pem
+
+      - name: Create terraform.tfvars
+        run: |
+          cd Terraform
+          cat > terraform.tfvars <<EOF
+          tenancy_ocid = "${{ secrets.OCI_TENANCY_OCID }}"
+          user_ocid = "${{ secrets.OCI_USER_OCID }}"
+          fingerprint = "${{ secrets.OCI_FINGERPRINT }}"
+          private_key_path = "$HOME/.oci/private_key.pem"
+          region = "${{ secrets.OCI_REGION }}"
+          compartment_ocid = "${{ secrets.OCI_COMPARTMENT_OCID }}"
+          subnet_id = "${{ secrets.OCI_SUBNET_ID }}"
+          availability_domain = "${{ secrets.OCI_AVAILABILITY_DOMAIN }}"
+          ubuntu_image_ocid = "${{ secrets.OCI_UBUNTU_IMAGE_OCID }}"
+          ssh_public_key = "${{ secrets.SSH_PUBLIC_KEY }}"
+          EOF
+
+      - name: Terraform Init
+        run: |
+          cd Terraform
+          terraform init
+
+      - name: Terraform Validate
+        run: |
+          cd Terraform
+          terraform validate
+
+      - name: Terraform Plan
+        run: |
+          cd Terraform
+          terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: |
+          cd Terraform
+          terraform apply -auto-approve tfplan
+
+      - name: Get Instance IP
+        id: terraform-output
+        run: |
+          cd Terraform
+          INSTANCE_IP=$(terraform output -raw instance_public_ip)
+          echo "ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          echo "✅ Instance IP: $INSTANCE_IP"
+
+      - name: Wait for instance to be ready
+        run: |
+          echo "⏳ Esperando a que la instancia esté lista..."
+          sleep 60
+
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: infrastructure
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ needs.infrastructure.outputs.instance_ip }} >> ~/.ssh/known_hosts
+
+      - name: Deploy with Docker Compose
+        run: |
+          scp -i ~/.ssh/id_rsa docker-compose.yml ubuntu@${{ needs.infrastructure.outputs.instance_ip }}:/home/ubuntu/
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ needs.infrastructure.outputs.instance_ip }} << 'EOF'
+            # Actualizar imágenes
+            docker pull ${{ env.BACKEND_IMAGE }}:latest
+            docker pull ${{ env.FRONTEND_IMAGE }}:latest
+            
+            # Detener contenedores existentes
+            docker compose down || true
+            
+            # Iniciar nuevos contenedores
+            docker compose up -d
+            
+            # Mostrar estado
+            docker ps
+            
+            # Verificar logs
+            sleep 10
+            docker compose logs
+          EOF
+
+      - name: Configure Firewall
+        run: |
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ needs.infrastructure.outputs.instance_ip }} << 'EOF'
+            sudo ufw allow 3000/tcp
+            sudo ufw allow 8000/tcp
+            sudo ufw status
+          EOF
+
+      - name: Health Check
+        run: |
+          echo "🔍 Verificando estado de la aplicación..."
+          sleep 15
+          
+          BACKEND_URL="http://${{ needs.infrastructure.outputs.instance_ip }}:8000/api/health"
+          FRONTEND_URL="http://${{ needs.infrastructure.outputs.instance_ip }}:3000"
+          
+          echo "Verificando Backend: $BACKEND_URL"
+          curl -f $BACKEND_URL || echo "⚠️ Backend no responde"
+          
+          echo "Verificando Frontend: $FRONTEND_URL"
+          curl -f $FRONTEND_URL || echo "⚠️ Frontend no responde"
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [infrastructure, deploy]
+    if: always()
+    steps:
+      - name: Send Success Email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "✅ Despliegue Exitoso - Práctica 3.2"
+          to: ${{ env.NOTIFICATION_EMAIL }}
+          from: GitHub Actions
+          body: |
+            ✅ El despliegue se completó exitosamente!
+            
+            📋 Detalles del Despliegue:
+            - Repositorio: ${{ github.repository }}
+            - Commit: ${{ github.sha }}
+            - Rama: ${{ github.ref_name }}
+            - Ejecutado por: ${{ github.actor }}
+            
+            🌐 URLs de Acceso:
+            - Frontend: http://${{ needs.infrastructure.outputs.instance_ip }}:3000
+            - Backend: http://${{ needs.infrastructure.outputs.instance_ip }}:8000
+            - Backend API Info: http://${{ needs.infrastructure.outputs.instance_ip }}:8000/api/info
+            
+            🖥️ IP Pública: ${{ needs.infrastructure.outputs.instance_ip }}
+            
+            🔗 Ver workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Send Failure Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "❌ Despliegue Fallido - Práctica 3.2"
+          to: ${{ env.NOTIFICATION_EMAIL }}
+          from: GitHub Actions
+          body: |
+            ❌ El despliegue ha fallado!
+            
+            📋 Detalles del Despliegue:
+            - Repositorio: ${{ github.repository }}
+            - Commit: ${{ github.sha }}
+            - Rama: ${{ github.ref_name }}
+            - Ejecutado por: ${{ github.actor }}
+            
+            🖥️ IP Pública (si fue provisionada): ${{ needs.infrastructure.outputs.instance_ip }}
+            
+            🔗 Ver logs del error: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Por favor revisa los logs para más detalles.
